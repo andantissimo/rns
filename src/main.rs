@@ -1,16 +1,14 @@
 use std::collections::HashMap;
-use std::default::Default;
 use std::env::args;
-use std::fmt::{self, Display, Formatter};
-use std::fs::{self};
-use std::io::{self, ErrorKind};
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::fs::{metadata, read_to_string};
+use std::io::{ErrorKind, Result as IOResult};
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::str::{self, FromStr};
+use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, RwLock};
 use std::thread::{sleep, spawn};
 use std::time::{Duration, SystemTime};
-use std::vec::Vec;
 
 #[allow(dead_code)]
 #[repr(u8)]
@@ -213,7 +211,7 @@ impl Record<'_> {
 
 impl Display for Opcode {
     #[allow(unreachable_patterns)]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
             Opcode::QUERY  => "QUERY",
             Opcode::IQUERY => "IQUERY",
@@ -225,7 +223,7 @@ impl Display for Opcode {
 
 impl Display for Rcode {
     #[allow(unreachable_patterns)]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
             Rcode::NOERROR  => "NOERROR",
             Rcode::FORMERR  => "FORMERR",
@@ -240,7 +238,7 @@ impl Display for Rcode {
 
 impl Display for Qtype {
     #[allow(unreachable_patterns)]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
             Qtype::A     => "A",
             Qtype::NS    => "NS",
@@ -258,7 +256,7 @@ impl Display for Qtype {
 
 impl Display for Qclass {
     #[allow(unreachable_patterns)]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
             Qclass::IN  => "IN",
             Qclass::ANY => "*",
@@ -268,7 +266,7 @@ impl Display for Qclass {
 }
 
 impl Display for Header {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}.{} {} {}/{}/{}/{} {} QD[{}] AN[{}] NS[{}] AR[{}]",
             if self.qr { "R" } else { "Q" }, self.id, self.opcode,
             if self.aa { "AA" } else { "--" },
@@ -280,22 +278,22 @@ impl Display for Header {
 }
 
 impl Display for Qname<'_> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         Ok(for (i, label) in self.labels.iter().enumerate() {
             if i > 0 { write!(f, ".")? }
-            write!(f, "{}", str::from_utf8(&label).unwrap())?
+            write!(f, "{}", from_utf8(&label).unwrap())?
         })
     }
 }
 
 impl Display for Question<'_> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{} {} {}", self.qname, self.qtype, self.qclass)
     }
 }
 
 impl Display for Record<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{} {} {} {}", self.name, self.rtype, self.class, self.ttl)?;
         match self.rtype {
             Qtype::A     => write!(f, " {}", IpAddr::from(TryInto::<[u8; 4]>::try_into(self.rdata).unwrap())),
@@ -325,7 +323,7 @@ impl Display for Record<'_> {
             }
             Qtype::TXT   => {
                 let length = self.rdata[0] as usize;
-                write!(f, " \"{}\"", str::from_utf8(&self.rdata[1..][..length]).unwrap())
+                write!(f, " \"{}\"", from_utf8(&self.rdata[1..][..length]).unwrap())
             }
             Qtype::AAAA  => write!(f, " {}", IpAddr::from(TryInto::<[u8; 16]>::try_into(self.rdata).unwrap())),
             _            => Ok(for x in self.rdata { write!(f, " {:02X}", x)? }),
@@ -333,10 +331,9 @@ impl Display for Record<'_> {
     }
 }
 
-fn parse_hosts(content: &str) -> HashMap<String, Vec<IpAddr>> {
-    let mut hosts: HashMap<String, Vec<IpAddr>> = HashMap::new();
+fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
     for line in content.split('\n').filter(|s| s.len() > 0 && !s.starts_with('#')) {
-        let mut addr: Option<IpAddr> = Default::default();
+        let mut addr: Option<IpAddr> = None;
         for (i, s) in line.split(char::is_whitespace).filter(|s| s.len() > 0).enumerate() {
             if i == 0 {
                 addr = Some(IpAddr::from_str(s).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
@@ -348,10 +345,9 @@ fn parse_hosts(content: &str) -> HashMap<String, Vec<IpAddr>> {
             }
         }
     }
-    hosts
 }
 
-fn main() -> io::Result<()> {
+fn main() -> IOResult<()> {
     if args().any(|a| a == "-h" || a == "--help") {
         eprintln!("Usage: rns [options...]");
         eprintln!();
@@ -379,40 +375,39 @@ fn main() -> io::Result<()> {
         (verbose, Arc::new(files), ttl)
     };
     let hosts_reader = Arc::new(RwLock::new({
-        let mut content = String::new();
+        let mut hosts = HashMap::new();
         for path in hosts_files.iter() {
-            content.push_str(&fs::read_to_string(path).unwrap_or(Default::default()));
+            parse_hosts(&read_to_string(path).unwrap_or_default(), &mut hosts);
         }
-        parse_hosts(&content)
+        hosts
     }));
     let hosts_writer = hosts_reader.clone();
     let hosts_files_clone = hosts_files.clone();
     let hosts_files_watch_interval = Duration::from_secs(4);
     spawn(move || {
         let hosts_files = hosts_files_clone;
-        let mut lastmtime = hosts_files.iter()
-            .map(|path| fs::metadata(path).unwrap().modified().unwrap())
-            .fold(SystemTime::UNIX_EPOCH, |a, b| a.max(b));
+        let min_mtime = SystemTime::UNIX_EPOCH;
+        let get_mtime = |path: &str|
+            if let Ok(m) = metadata(path) { m.modified().unwrap() } else { min_mtime };
+        let mut lastmtime = hosts_files.iter().fold(min_mtime, |t, p| get_mtime(p).max(t));
         loop {
             sleep(hosts_files_watch_interval);
-            let mtime = hosts_files.iter()
-                .map(|path| fs::metadata(path).unwrap().modified().unwrap())
-                .fold(SystemTime::UNIX_EPOCH, |a, b| a.max(b));
+            let mtime = hosts_files.iter().fold(min_mtime, |t, p| get_mtime(p).max(t));
             if mtime == lastmtime { continue }
             lastmtime = mtime;
-            let mut content = String::new();
+            let mut hosts = HashMap::new();
             for path in hosts_files.iter() {
-                content.push_str(&fs::read_to_string(path).unwrap_or(Default::default()));
+                parse_hosts(&read_to_string(path).unwrap_or_default(), &mut hosts);
             }
-            let mut hosts = hosts_writer.write().unwrap();
-            hosts.clear();
-            for (k, v) in parse_hosts(&content) {
-                hosts.insert(k, v);
+            let mut writer = hosts_writer.write().unwrap();
+            writer.clear();
+            for (k, v) in hosts {
+                writer.insert(k, v);
             }
             if verbose { eprintln!("Reloaded {}", hosts_files.join(" and ")) }
         }
     });
-    let nameservers: Vec<IpAddr> = fs::read_to_string("/etc/resolv.conf")?.split('\n')
+    let nameservers: Vec<IpAddr> = read_to_string("/etc/resolv.conf")?.split('\n')
         .filter(|line| line.starts_with("nameserver "))
         .map(|line| IpAddr::from_str(line[11..].trim()).unwrap())
         .collect();
