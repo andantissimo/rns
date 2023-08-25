@@ -370,7 +370,7 @@ fn main() -> IOResult<()> {
             } else if k == "-H" || k == "--addn-hosts" {
                 if let Some(v) = it.next() { files.push(v) }
             } else if k == "-T" || k == "--local-ttl" {
-                if let Some(v) = it.next() { ttl = v.parse().unwrap_or(0) }
+                if let Some(v) = it.next() { ttl = v.parse().unwrap_or(ttl) }
             }
         }
         (verbose, Arc::new(files), ttl)
@@ -427,11 +427,13 @@ fn main() -> IOResult<()> {
                 let qheader = Header::from_bytes(&qpacket);
                 if verbose { eprintln!("{} from {}", qheader, remote) }
                 if qheader.qr || qheader.aa || qheader.ra || qheader.rcode != Rcode::NOERROR || qheader.ancount > 0 {
-                    server.send_to(&Header::error(qheader.id, qheader.opcode, Rcode::FORMERR).to_bytes(), remote).unwrap_or(0);
+                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::FORMERR);
+                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
                     continue 'accept
                 }
                 if qheader.opcode != Opcode::QUERY || qheader.tc || qheader.qdcount != 1 || qheader.nscount > 0 || qheader.arcount > 0 {
-                    server.send_to(&Header::error(qheader.id, qheader.opcode, Rcode::NOTIMP).to_bytes(), remote).unwrap_or(0);
+                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NOTIMP);
+                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
                     continue 'accept
                 }
                 let (question, qend) = Question::from_bytes(&qpacket, 12);
@@ -462,7 +464,7 @@ fn main() -> IOResult<()> {
                             };
                             match rdata {
                                 Some(rdata) if rdata.iter().any(|x| *x != 0) => {
-                                    let qtype = match (question.qtype, rdata.len()) {
+                                    let rtype = match (question.qtype, rdata.len()) {
                                         (Type::ALL, 4) => Type::A,
                                         (Type::ALL, 8) => Type::AAAA,
                                         _              => question.qtype,
@@ -472,17 +474,18 @@ fn main() -> IOResult<()> {
                                     rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
                                     rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
                                     rbuffer[qend..][0..2].clone_from_slice(&[0xC0, 12]);
-                                    rbuffer[qend..][2..4].clone_from_slice(&(qtype as u16).to_be_bytes());
+                                    rbuffer[qend..][2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
                                     rbuffer[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
                                     rbuffer[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
                                     rbuffer[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
                                     rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
                                     let rpacket = &rbuffer[..qend+12+rdata.len()];
-                                    server.send_to(&rpacket, remote).unwrap_or(0);
+                                    server.send_to(&rpacket, remote).unwrap_or_default();
                                     continue 'accept
                                 }
                                 Some(_) => {
-                                    server.send_to(&Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN).to_bytes(), remote).unwrap_or(0);
+                                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
+                                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
                                     continue 'accept
                                 }
                                 None => {}
@@ -513,7 +516,7 @@ fn main() -> IOResult<()> {
                         }
                     }
                 }
-                server.send_to(&rpacket, remote).unwrap_or(0);
+                server.send_to(&rpacket, remote).unwrap_or_default();
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // not an error, ignore
