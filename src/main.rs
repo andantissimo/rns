@@ -465,20 +465,20 @@ fn main() -> IOResult<()> {
                                     let qtype = match (question.qtype, rdata.len()) {
                                         (Type::ALL, 4) => Type::A,
                                         (Type::ALL, 8) => Type::AAAA,
-                                        _               => question.qtype,
+                                        _              => question.qtype,
                                     };
-                                    let aheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
-                                    let mut apacket: [u8; 512] = [0; 512];
-                                    apacket[0..12].clone_from_slice(&aheader.to_bytes());
-                                    apacket[12..qend].clone_from_slice(&qpacket[12..qend]);
-                                    apacket[qend..][0..2].clone_from_slice(&[0xC0, 12]);
-                                    apacket[qend..][2..4].clone_from_slice(&(qtype as u16).to_be_bytes());
-                                    apacket[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
-                                    apacket[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
-                                    apacket[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
-                                    apacket[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
-                                    let apacket = &apacket[..qend+12+rdata.len()];
-                                    server.send_to(&apacket, remote).unwrap_or(0);
+                                    let rheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
+                                    let mut rbuffer = [0; 512];
+                                    rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
+                                    rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
+                                    rbuffer[qend..][0..2].clone_from_slice(&[0xC0, 12]);
+                                    rbuffer[qend..][2..4].clone_from_slice(&(qtype as u16).to_be_bytes());
+                                    rbuffer[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
+                                    rbuffer[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
+                                    rbuffer[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
+                                    rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
+                                    let rpacket = &rbuffer[..qend+12+rdata.len()];
+                                    server.send_to(&rpacket, remote).unwrap_or(0);
                                     continue 'accept
                                 }
                                 Some(_) => {
@@ -492,28 +492,28 @@ fn main() -> IOResult<()> {
                 }
                 let nameserver = nameservers[0];
                 client.send_to(&qpacket, (nameservers[0], 53))?;
-                let mut apacket = [0; 512];
-                let alength = client.recv(&mut apacket)?;
-                let apacket = &apacket[..alength];
+                let mut rbuffer = [0; 512];
+                let alength = client.recv(&mut rbuffer)?;
+                let rpacket = &rbuffer[..alength];
                 if verbose {
-                    let aheader = Header::from_bytes(&apacket);
-                    eprintln!("{} from {}", aheader, nameserver);
+                    let rheader = Header::from_bytes(&rpacket);
+                    eprintln!("{} from {}", rheader, nameserver);
                     let mut offset = 12;
-                    for _ in 0..aheader.qdcount {
-                        let (question, qend) = Question::from_bytes(&apacket, offset);
+                    for _ in 0..rheader.qdcount {
+                        let (question, qend) = Question::from_bytes(&rpacket, offset);
                         eprintln!("  {}", question);
                         offset = qend;
                     }
-                    for (count, kind) in [(aheader.ancount, "AN"), (aheader.nscount, "NS"), (aheader.arcount, "AR")] {
+                    for (count, kind) in [(rheader.ancount, "AN"), (rheader.nscount, "NS"), (rheader.arcount, "AR")] {
                         for i in 0..count {
-                            let (record, rend) = Record::from_bytes(&apacket, offset);
+                            let (record, rend) = Record::from_bytes(&rpacket, offset);
                             if i == 0 { eprintln!("{}", kind) }
                             eprintln!("  {}", record);
                             offset = rend;
                         }
                     }
                 }
-                server.send_to(&apacket, remote).unwrap_or(0);
+                server.send_to(&rpacket, remote).unwrap_or(0);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // not an error, ignore
