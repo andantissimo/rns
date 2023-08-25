@@ -36,7 +36,7 @@ enum Rcode {
 #[allow(dead_code)]
 #[repr(u16)]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Qtype {
+enum Type {
     A     = 1,
     NS    = 2,
     CNAME = 5,
@@ -51,7 +51,7 @@ enum Qtype {
 #[allow(dead_code)]
 #[repr(u16)]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Qclass {
+enum Class {
     IN  = 1,
     ANY = 255,
 }
@@ -72,21 +72,21 @@ struct Header {
     arcount: u16,
 }
 
-struct Qname<'a> {
+struct Name<'a> {
     packet: &'a [u8],
     labels: Vec<&'a [u8]>,
 }
 
 struct Question<'a> {
-    qname : Qname<'a>,
-    qtype : Qtype,
-    qclass: Qclass,
+    qname : Name<'a>,
+    qtype : Type,
+    qclass: Class,
 }
 
 struct Record<'a> {
-    name  : Qname<'a>,
-    rtype : Qtype,
-    class : Qclass,
+    rname : Name<'a>,
+    rtype : Type,
+    rclass: Class,
     ttl   : u32,
     rdata : &'a [u8],
 }
@@ -163,18 +163,18 @@ impl Header {
     }
 }
 
-impl Qname<'_> {
-    fn from_bytes(packet: &[u8], offset: usize) -> (Qname, usize) {
+impl Name<'_> {
+    fn from_bytes(packet: &[u8], offset: usize) -> (Name, usize) {
         assert!(offset + 1 < packet.len());
         let mut cursor = offset;
-        let mut qname = Qname { packet, labels: Vec::new() };
+        let mut qname = Name { packet, labels: Vec::new() };
         loop {
             let length = packet[cursor] as usize;
             cursor += 1;
             if length == 0 { break }
             if (length & 0xC0) == 0xC0 {
                 let ptr = (length & 0x3F) << 8 | packet[cursor] as usize;
-                qname.labels.append(&mut Qname::from_bytes(packet, ptr).0.labels);
+                qname.labels.append(&mut Name::from_bytes(packet, ptr).0.labels);
                 return (qname, cursor + 1);
             }
             qname.labels.push(&packet[cursor..][..length]);
@@ -187,7 +187,7 @@ impl Qname<'_> {
 impl Question<'_> {
     fn from_bytes(packet: &[u8], offset: usize) -> (Question, usize) {
         assert!(offset + 5 < packet.len());
-        let (qname, offset) = Qname::from_bytes(&packet, offset);
+        let (qname, offset) = Name::from_bytes(&packet, offset);
         (Question {
             qname,
             qtype : unsafe { transmute(u16::from_be_bytes(packet[offset..][0..2].try_into().unwrap())) },
@@ -199,13 +199,13 @@ impl Question<'_> {
 impl Record<'_> {
     fn from_bytes(packet: &[u8], offset: usize) -> (Record, usize) {
         assert!(offset + 11 < packet.len());
-        let (name, offset) = Qname::from_bytes(&packet, offset);
-        let rtype: Qtype  = unsafe { transmute(u16::from_be_bytes(packet[offset..][0..2].try_into().unwrap())) };
-        let class: Qclass = unsafe { transmute(u16::from_be_bytes(packet[offset..][2..4].try_into().unwrap())) };
+        let (rname, offset) = Name::from_bytes(&packet, offset);
+        let rtype: Type   = unsafe { transmute(u16::from_be_bytes(packet[offset..][0..2].try_into().unwrap())) };
+        let rclass: Class = unsafe { transmute(u16::from_be_bytes(packet[offset..][2..4].try_into().unwrap())) };
         let ttl      = u32::from_be_bytes(packet[offset..][4..8].try_into().unwrap());
         let rdlength = u16::from_be_bytes(packet[offset..][8..10].try_into().unwrap());
         let rdata: &[u8]  = &packet[offset+10..][..rdlength as usize];
-        (Record { name, rtype, class, ttl, rdata }, offset + 10 + rdlength as usize)
+        (Record { rname, rtype, rclass, ttl, rdata }, offset + 10 + rdlength as usize)
     }
 }
 
@@ -236,31 +236,31 @@ impl Display for Rcode {
     }
 }
 
-impl Display for Qtype {
+impl Display for Type {
     #[allow(unreachable_patterns)]
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
-            Qtype::A     => "A",
-            Qtype::NS    => "NS",
-            Qtype::CNAME => "CNAME",
-            Qtype::SOA   => "SOA",
-            Qtype::PTR   => "PTR",
-            Qtype::MX    => "MX",
-            Qtype::TXT   => "TXT",
-            Qtype::AAAA  => "AAAA",
-            Qtype::ALL   => "*",
-            _            => "?"
+            Type::A     => "A",
+            Type::NS    => "NS",
+            Type::CNAME => "CNAME",
+            Type::SOA   => "SOA",
+            Type::PTR   => "PTR",
+            Type::MX    => "MX",
+            Type::TXT   => "TXT",
+            Type::AAAA  => "AAAA",
+            Type::ALL   => "*",
+            _           => "?"
         })
     }
 }
 
-impl Display for Qclass {
+impl Display for Class {
     #[allow(unreachable_patterns)]
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "{}", match self {
-            Qclass::IN  => "IN",
-            Qclass::ANY => "*",
-            _           => "?",
+            Class::IN  => "IN",
+            Class::ANY => "*",
+            _          => "?",
         })
     }
 }
@@ -277,11 +277,12 @@ impl Display for Header {
     }
 }
 
-impl Display for Qname<'_> {
+impl Display for Name<'_> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         Ok(for (i, label) in self.labels.iter().enumerate() {
             if i > 0 { write!(f, ".")? }
-            write!(f, "{}", from_utf8(&label).unwrap())?
+            String::from_iter(label.iter().map(|c| *c as char));
+            write!(f, "{}", from_utf8(label).unwrap_or("?"))?
         })
     }
 }
@@ -294,20 +295,20 @@ impl Display for Question<'_> {
 
 impl Display for Record<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "{} {} {} {}", self.name, self.rtype, self.class, self.ttl)?;
+        write!(f, "{} {} {} {}", self.rname, self.rtype, self.rclass, self.ttl)?;
         match self.rtype {
-            Qtype::A     => write!(f, " {}", IpAddr::from(TryInto::<[u8; 4]>::try_into(self.rdata).unwrap())),
-            Qtype::NS    |
-            Qtype::CNAME |
-            Qtype::PTR   => {
-                let offset = self.rdata.as_ptr() as usize - self.name.packet.as_ptr() as usize;
-                write!(f, " {}", Qname::from_bytes(self.name.packet, offset).0)
+            Type::A     => write!(f, " {}", IpAddr::from(TryInto::<[u8; 4]>::try_into(self.rdata).unwrap())),
+            Type::NS    |
+            Type::CNAME |
+            Type::PTR   => {
+                let offset = self.rdata.as_ptr() as usize - self.rname.packet.as_ptr() as usize;
+                write!(f, " {}", Name::from_bytes(self.rname.packet, offset).0)
             }
-            Qtype::SOA   => {
-                let offset = self.rdata.as_ptr() as usize - self.name.packet.as_ptr() as usize;
-                let (mname, offset) = Qname::from_bytes(self.name.packet, offset);
-                let (rname, offset) = Qname::from_bytes(self.name.packet, offset);
-                let octets = &self.name.packet[offset..];
+            Type::SOA   => {
+                let offset = self.rdata.as_ptr() as usize - self.rname.packet.as_ptr() as usize;
+                let (mname, offset) = Name::from_bytes(self.rname.packet, offset);
+                let (rname, offset) = Name::from_bytes(self.rname.packet, offset);
+                let octets = &self.rname.packet[offset..];
                 let serial  = u32::from_be_bytes(octets[0..4].try_into().unwrap());
                 let refresh = u32::from_be_bytes(octets[4..8].try_into().unwrap());
                 let retry   = u32::from_be_bytes(octets[8..12].try_into().unwrap());
@@ -315,17 +316,17 @@ impl Display for Record<'_> {
                 let minimum = u32::from_be_bytes(octets[16..20].try_into().unwrap());
                 write!(f, " {} {} {} {} {} {} {}", mname, rname, serial, refresh, retry, expire, minimum)
             }
-            Qtype::MX    => {
-                let offset = self.rdata.as_ptr() as usize - self.name.packet.as_ptr() as usize;
+            Type::MX    => {
+                let offset = self.rdata.as_ptr() as usize - self.rname.packet.as_ptr() as usize;
                 let preference = u16::from_be_bytes(self.rdata[0..2].try_into().unwrap());
-                let (exchange, _) = Qname::from_bytes(self.name.packet, offset + 2);
+                let (exchange, _) = Name::from_bytes(self.rname.packet, offset + 2);
                 write!(f, " {} {}", preference, exchange)
             }
-            Qtype::TXT   => {
+            Type::TXT   => {
                 let length = self.rdata[0] as usize;
                 write!(f, " \"{}\"", from_utf8(&self.rdata[1..][..length]).unwrap())
             }
-            Qtype::AAAA  => write!(f, " {}", IpAddr::from(TryInto::<[u8; 16]>::try_into(self.rdata).unwrap())),
+            Type::AAAA  => write!(f, " {}", IpAddr::from(TryInto::<[u8; 16]>::try_into(self.rdata).unwrap())),
             _            => Ok(for x in self.rdata { write!(f, " {:02X}", x)? }),
         }
     }
@@ -443,14 +444,14 @@ fn main() -> IOResult<()> {
                     if let Some(addrs) = hosts_reader.read().unwrap().get(&pattern) {
                         for addr in addrs {
                             let rdata: Option<Vec<u8>> = match (question.qtype, *addr) {
-                                (Qtype::A | Qtype::ALL, IpAddr::V4(addr)) => {
+                                (Type::A | Type::ALL, IpAddr::V4(addr)) => {
                                     if verbose {
                                         eprintln!("Found in {}", hosts_files.join(" or "));
                                         eprintln!("  {} {}", addr, pattern);
                                     }
                                     Some(addr.octets().to_vec())
                                 }
-                                (Qtype::AAAA | Qtype::ALL, IpAddr::V6(addr)) => {
+                                (Type::AAAA | Type::ALL, IpAddr::V6(addr)) => {
                                     if verbose {
                                         eprintln!("Found in {}", hosts_files.join(" or "));
                                         eprintln!("  {} {}", addr, pattern);
@@ -462,8 +463,8 @@ fn main() -> IOResult<()> {
                             match rdata {
                                 Some(rdata) if rdata.iter().any(|x| *x != 0) => {
                                     let qtype = match (question.qtype, rdata.len()) {
-                                        (Qtype::ALL, 4) => Qtype::A,
-                                        (Qtype::ALL, 8) => Qtype::AAAA,
+                                        (Type::ALL, 4) => Type::A,
+                                        (Type::ALL, 8) => Type::AAAA,
                                         _               => question.qtype,
                                     };
                                     let aheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
