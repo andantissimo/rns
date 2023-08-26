@@ -355,25 +355,29 @@ fn main() -> IOResult<()> {
         eprintln!("Options:");
         eprintln!("  -h, --help               Show this help message and exit");
         eprintln!("  -v, --verbose            Increase verbosity");
+        eprintln!("  -4, --ipv4-only          Listen to 0.0.0.0:53 instead of [::]:53");
         eprintln!("  -H, --addn-hosts <path>  Hosts files to be read in addition to /etc/hosts");
         eprintln!("  -T, --local-ttl  <int>   Time-to-live in seconds for replies from /etc/hosts");
         return Ok(());
     }
-    let (verbose, hosts_files, local_ttl) = {
+    let (verbose, ipv4only, hosts_files, local_ttl) = {
         let mut verbose = false;
+        let mut ipv4only = false;
         let mut files = vec!["/etc/hosts".to_string()];
         let mut ttl: u32 = 0;
         let mut it = args();
         while let Some(k) = it.next() {
             if k == "-v" || k == "--verbose" {
                 verbose = true;
+            } else if k == "-4" || k == "--ipv4-only" {
+                ipv4only = true;
             } else if k == "-H" || k == "--addn-hosts" {
                 if let Some(v) = it.next() { files.push(v) }
             } else if k == "-T" || k == "--local-ttl" {
                 if let Some(v) = it.next() { ttl = v.parse().unwrap_or(ttl) }
             }
         }
-        (verbose, Arc::new(files), ttl)
+        (verbose, ipv4only, Arc::new(files), ttl)
     };
     let hosts_reader = Arc::new(RwLock::new({
         let mut hosts = HashMap::new();
@@ -414,7 +418,11 @@ fn main() -> IOResult<()> {
         .map(|addr| SocketAddr::new(addr, 53))
         .collect();
     let timeout = Duration::from_secs(15);
-    let server = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 53))?;
+    let server = UdpSocket::bind(if ipv4only {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53)
+    } else {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 53)
+    })?;
     let client = UdpSocket::bind(if nameservers.iter().any(|a| a.is_ipv4()) {
         SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
     } else {
