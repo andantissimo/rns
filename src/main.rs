@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::{metadata, read_to_string};
 use std::io::{ErrorKind, Result as IOResult};
 use std::mem::transmute;
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket, Ipv6Addr};
 use std::str::{FromStr, from_utf8};
 use std::sync::{Arc, RwLock};
 use std::thread::{sleep, spawn};
@@ -337,7 +337,7 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
         let mut addr: Option<IpAddr> = None;
         for (i, s) in line.split(char::is_whitespace).filter(|s| s.len() > 0).enumerate() {
             if i == 0 {
-                addr = Some(IpAddr::from_str(s).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+                addr = Some(IpAddr::from_str(s).unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
             } else {
                 hosts.entry(s.to_string()).or_default().push(addr.unwrap());
                 if s.starts_with("*.") {
@@ -408,13 +408,19 @@ fn main() -> IOResult<()> {
             if verbose { eprintln!("Reloaded {}", hosts_files.join(" and ")) }
         }
     });
-    let nameservers: Vec<IpAddr> = read_to_string("/etc/resolv.conf")?.split('\n')
+    let nameservers: Vec<SocketAddr> = read_to_string("/etc/resolv.conf")?.split('\n')
         .filter(|line| line.starts_with("nameserver "))
-        .map(|line| IpAddr::from_str(line[11..].trim()).unwrap())
+        .map(|line| IpAddr::from_str(line[11..].trim()).expect("unexpected syntax in resolv.conf"))
+        .map(|addr| SocketAddr::new(addr, 53))
         .collect();
     let timeout = Duration::from_secs(15);
-    let server = UdpSocket::bind("0.0.0.0:53")?;
-    let client = UdpSocket::bind("0.0.0.0:0")?;
+    let server = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 53))?;
+    let client = UdpSocket::bind(if nameservers.iter().any(|a| a.is_ipv4()) {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    })?;
+    client.connect(&nameservers[..])?;
     server.set_read_timeout(Some(timeout))?;
     server.set_write_timeout(Some(timeout))?;
     client.set_read_timeout(Some(timeout))?;
@@ -493,14 +499,13 @@ fn main() -> IOResult<()> {
                         }
                     }
                 }
-                let nameserver = nameservers[0];
-                client.send_to(&qpacket, (nameservers[0], 53))?;
+                client.send(&qpacket)?;
                 let mut rbuffer = [0; 512];
                 let rlength = client.recv(&mut rbuffer)?;
                 let rpacket = &rbuffer[..rlength];
                 if verbose {
                     let rheader = Header::from_bytes(&rpacket);
-                    eprintln!("{} from {}", rheader, nameserver);
+                    eprintln!("{} from {}", rheader, client.peer_addr().unwrap());
                     let mut offset = 12;
                     for _ in 0..rheader.qdcount {
                         let (question, qend) = Question::from_bytes(&rpacket, offset);
