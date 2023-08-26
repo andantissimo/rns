@@ -496,8 +496,8 @@ fn main() -> IOResult<()> {
                 let nameserver = nameservers[0];
                 client.send_to(&qpacket, (nameservers[0], 53))?;
                 let mut rbuffer = [0; 512];
-                let alength = client.recv(&mut rbuffer)?;
-                let rpacket = &rbuffer[..alength];
+                let rlength = client.recv(&mut rbuffer)?;
+                let rpacket = &rbuffer[..rlength];
                 if verbose {
                     let rheader = Header::from_bytes(&rpacket);
                     eprintln!("{} from {}", rheader, nameserver);
