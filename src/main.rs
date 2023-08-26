@@ -337,7 +337,7 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
         let mut addr: Option<IpAddr> = None;
         for (i, s) in line.split(char::is_whitespace).filter(|s| s.len() > 0).enumerate() {
             if i == 0 {
-                addr = Some(IpAddr::from_str(s).unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
+                addr = Some(s.parse().unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
             } else {
                 hosts.entry(s.to_string()).or_default().push(addr.unwrap());
                 if s.starts_with("*.") {
