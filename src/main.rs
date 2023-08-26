@@ -367,14 +367,20 @@ fn main() -> IOResult<()> {
         let mut ttl: u32 = 0;
         let mut it = args();
         while let Some(k) = it.next() {
-            if k == "-v" || k == "--verbose" {
-                verbose = true;
-            } else if k == "-4" || k == "--ipv4-only" {
-                ipv4only = true;
-            } else if k == "-H" || k == "--addn-hosts" {
-                if let Some(v) = it.next() { files.push(v) }
-            } else if k == "-T" || k == "--local-ttl" {
-                if let Some(v) = it.next() { ttl = v.parse().unwrap_or(ttl) }
+            match k.as_str() {
+                "-v" | "--verbose" => {
+                    verbose = true;
+                }
+                "-4" | "--ipv4-only" => {
+                    ipv4only = true;
+                }
+                "-H" | "--addn-hosts" => {
+                    if let Some(v) = it.next() { files.push(v) }
+                }
+                "-T" | "--local-ttl" => {
+                    if let Some(v) = it.next() { ttl = v.parse().unwrap_or(ttl) }
+                }
+                _ => {}
             }
         }
         (verbose, ipv4only, Arc::new(files), ttl)
