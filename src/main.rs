@@ -465,7 +465,7 @@ fn main() -> IOResult<()> {
                 for pattern in patterns {
                     if let Some(addrs) = hosts_reader.read().unwrap().get(&pattern) {
                         for addr in addrs {
-                            let rdata: Option<Vec<u8>> = match (question.qtype, *addr) {
+                            let rdata: Option<Vec<u8>> = match (question.qtype, addr) {
                                 (Type::A | Type::ALL, IpAddr::V4(addr)) => {
                                     if verbose {
                                         eprintln!("Found in {}", hosts_files.join(" or "));
@@ -483,11 +483,15 @@ fn main() -> IOResult<()> {
                                 _ => None
                             };
                             match rdata {
-                                Some(rdata) if rdata.iter().any(|x| *x != 0) => {
-                                    let rtype = match (question.qtype, rdata.len()) {
-                                        (Type::ALL, 4) => Type::A,
-                                        (Type::ALL, 8) => Type::AAAA,
-                                        _              => question.qtype,
+                                Some(_) if addr.is_unspecified() => {
+                                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
+                                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
+                                    continue 'accept
+                                }
+                                Some(rdata) => {
+                                    let rtype = match addr {
+                                        IpAddr::V4(_) => Type::A,
+                                        IpAddr::V6(_) => Type::AAAA,
                                     };
                                     let rheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
                                     let mut rbuffer = [0; 512];
@@ -501,11 +505,6 @@ fn main() -> IOResult<()> {
                                     rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
                                     let rpacket = &rbuffer[..qend+12+rdata.len()];
                                     server.send_to(&rpacket, remote).unwrap_or_default();
-                                    continue 'accept
-                                }
-                                Some(_) => {
-                                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
-                                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
                                     continue 'accept
                                 }
                                 None => {}
