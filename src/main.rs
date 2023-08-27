@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env::args;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -340,31 +341,29 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
                 addr = Some(s.parse().unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
             } else {
                 hosts.entry(s.to_string()).or_default().push(addr.unwrap());
-                if s.starts_with("*.") || s.starts_with("**.") {
-                    hosts.entry(s[2..].to_string()).or_default().push(addr.unwrap())
-                }
             }
         }
     }
 }
 
-fn search_host(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Option<(String, Vec<IpAddr>)> {
+fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String, Vec<IpAddr>)> {
     let patterns = if let Some(dot) = host.find('.') {
-        vec![host.to_string(), format!("*{}", host[dot..].to_string()), format!("**{}", host[dot..].to_string())]
+        vec![host.to_string(), format!("*{}", host[dot..].to_string())]
     } else {
         vec![host.to_string()]
     };
+    let mut matches = Vec::new();
     for pattern in patterns {
-        if let Some((host, addrs)) = hosts.get_key_value(&pattern) {
-            return Some((host.clone(), addrs.clone()))
+        if let Some((_, addrs)) = hosts.get_key_value(&pattern) {
+            matches.push((pattern, addrs.clone()))
         }
     }
-    if host.contains('.') {
-        if let Some((host, addrs)) = hosts.iter().find(|(s, _)| s.starts_with('.') && host.ends_with(*s)) {
-            return Some((host.clone(), addrs.clone()))
-        }
+    if let Some((pattern, addrs)) = hosts.iter().find(|(pat, _)| {
+        pat.starts_with("**.") && (host == &pat[3..] || host.ends_with(&pat[2..]))
+    }) {
+        matches.push((pattern.clone(), addrs.clone()))
     }
-    None
+    matches
 }
 
 fn main() -> IOResult<()> {
@@ -477,53 +476,57 @@ fn main() -> IOResult<()> {
                 }
                 let (question, qend) = Question::from_bytes(&qpacket, 12);
                 if verbose { eprintln!("  {}", question) }
-                if let Some((host, addrs)) = search_host(&hosts_reader.read().unwrap(), &question.qname.to_string()) {
-                    for addr in addrs {
-                        let rdata: Option<Vec<u8>> = match (question.qtype, addr) {
-                            (Type::A | Type::ALL, IpAddr::V4(addr)) => {
-                                if verbose {
-                                    eprintln!("Found in {}", hosts_files.join(" or "));
-                                    eprintln!("  {} {}", addr, host);
-                                }
-                                Some(addr.octets().to_vec())
+                let matches = match_hosts(&hosts_reader.read().unwrap(), &question.qname.to_string());
+                if matches.len() > 0 {
+                    if verbose {
+                        eprintln!("Found in {}", hosts_files.join(" or "));
+                        for (host, addrs) in matches.iter() {
+                            for addr in addrs.iter() {
+                                eprintln!("  {} {}", addr.to_string(), host)
                             }
-                            (Type::AAAA | Type::ALL, IpAddr::V6(addr)) => {
-                                if verbose {
-                                    eprintln!("Found in {}", hosts_files.join(" or "));
-                                    eprintln!("  {} {}", addr, host);
-                                }
-                                Some(addr.octets().to_vec())
-                            }
-                            _ => None
-                        };
-                        match rdata {
-                            Some(_) if addr.is_unspecified() => {
-                                let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
-                                server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
-                                continue 'accept
-                            }
-                            Some(rdata) => {
-                                let rtype = match addr {
-                                    IpAddr::V4(_) => Type::A,
-                                    IpAddr::V6(_) => Type::AAAA,
-                                };
-                                let rheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
-                                let mut rbuffer = [0; 512];
-                                rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
-                                rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
-                                rbuffer[qend..][0..2].clone_from_slice(&[0xC0, 12]);
-                                rbuffer[qend..][2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
-                                rbuffer[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
-                                rbuffer[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
-                                rbuffer[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
-                                rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
-                                let rpacket = &rbuffer[..qend+12+rdata.len()];
-                                server.send_to(&rpacket, remote).unwrap_or_default();
-                                continue 'accept
-                            }
-                            None => {}
                         }
                     }
+                    let mut addrs: Vec<IpAddr> = matches.into_iter()
+                        .flat_map(|(_, addrs)| addrs)
+                        .filter(|addr| match (addr, question.qtype, remote) {
+                            (IpAddr::V4(_), Type::A | Type::ALL, _) => true,
+                            (IpAddr::V6(_), Type::AAAA | Type::ALL, _) => true,
+                            (IpAddr::V6(_), Type::A, SocketAddr::V6(_)) => true,
+                            _ => false,
+                        })
+                        .collect();
+                    addrs.sort_by(|a, b| {
+                        if a.is_ipv4() == b.is_ipv4() { return Ordering::Equal }
+                        if question.qtype != Type::AAAA && a.is_ipv4() { Ordering::Less } else { Ordering::Greater }
+                    });
+                    if addrs.is_empty() || addrs.iter().all(|addr| addr.is_unspecified()) {
+                        let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
+                        server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
+                        continue 'accept
+                    }
+                    let ancount = addrs.iter().filter(|addr| !addr.is_unspecified()).count() as u16;
+                    let rheader = Header::answer(qheader.id, qheader.opcode, 1, ancount);
+                    let mut rbuffer = [0; 512];
+                    rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
+                    rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
+                    let mut rslice = &mut rbuffer[qend..];
+                    for addr in addrs.iter().filter(|addr| !addr.is_unspecified()) {
+                        let (rtype, rdata) = match addr {
+                            IpAddr::V4(addr) => (Type::A, addr.octets().to_vec()),
+                            IpAddr::V6(addr) => (Type::AAAA, addr.octets().to_vec()),
+                        };
+                        rslice[0..2].clone_from_slice(&[0xC0, 12]);
+                        rslice[2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
+                        rslice[4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
+                        rslice[6..10].clone_from_slice(&local_ttl.to_be_bytes());
+                        rslice[10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
+                        rslice[12..][..rdata.len()].clone_from_slice(&rdata);
+                        rslice = &mut rslice[12+rdata.len()..];
+                    }
+                    let rlength = rslice.as_ptr() as usize - rbuffer.as_ptr() as usize;
+                    let rpacket = &rbuffer[..rlength];
+                    server.send_to(&rpacket, remote).unwrap_or_default();
+                    continue 'accept
                 }
                 client.send(&qpacket)?;
                 let mut rbuffer = [0; 512];
