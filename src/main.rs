@@ -340,12 +340,31 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
                 addr = Some(s.parse().unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
             } else {
                 hosts.entry(s.to_string()).or_default().push(addr.unwrap());
-                if s.starts_with("*.") {
-                    hosts.entry(s[2..].to_string()).or_default().push(addr.unwrap());
+                if s.starts_with("*.") || s.starts_with("**.") {
+                    hosts.entry(s[2..].to_string()).or_default().push(addr.unwrap())
                 }
             }
         }
     }
+}
+
+fn search_host(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Option<(String, Vec<IpAddr>)> {
+    let patterns = if let Some(dot) = host.find('.') {
+        vec![host.to_string(), format!("*{}", host[dot..].to_string()), format!("**{}", host[dot..].to_string())]
+    } else {
+        vec![host.to_string()]
+    };
+    for pattern in patterns {
+        if let Some((host, addrs)) = hosts.get_key_value(&pattern) {
+            return Some((host.clone(), addrs.clone()))
+        }
+    }
+    if host.contains('.') {
+        if let Some((host, addrs)) = hosts.iter().find(|(s, _)| s.starts_with('.') && host.ends_with(*s)) {
+            return Some((host.clone(), addrs.clone()))
+        }
+    }
+    None
 }
 
 fn main() -> IOResult<()> {
@@ -458,57 +477,51 @@ fn main() -> IOResult<()> {
                 }
                 let (question, qend) = Question::from_bytes(&qpacket, 12);
                 if verbose { eprintln!("  {}", question) }
-                let mut patterns = vec![question.qname.to_string()];
-                if let Some(dot) = patterns[0].find('.') {
-                    patterns.push(format!("*{}", &patterns[0][dot..]));
-                }
-                for pattern in patterns {
-                    if let Some(addrs) = hosts_reader.read().unwrap().get(&pattern) {
-                        for addr in addrs {
-                            let rdata: Option<Vec<u8>> = match (question.qtype, addr) {
-                                (Type::A | Type::ALL, IpAddr::V4(addr)) => {
-                                    if verbose {
-                                        eprintln!("Found in {}", hosts_files.join(" or "));
-                                        eprintln!("  {} {}", addr, pattern);
-                                    }
-                                    Some(addr.octets().to_vec())
+                if let Some((host, addrs)) = search_host(&hosts_reader.read().unwrap(), &question.qname.to_string()) {
+                    for addr in addrs {
+                        let rdata: Option<Vec<u8>> = match (question.qtype, addr) {
+                            (Type::A | Type::ALL, IpAddr::V4(addr)) => {
+                                if verbose {
+                                    eprintln!("Found in {}", hosts_files.join(" or "));
+                                    eprintln!("  {} {}", addr, host);
                                 }
-                                (Type::AAAA | Type::ALL, IpAddr::V6(addr)) => {
-                                    if verbose {
-                                        eprintln!("Found in {}", hosts_files.join(" or "));
-                                        eprintln!("  {} {}", addr, pattern);
-                                    }
-                                    Some(addr.octets().to_vec())
-                                }
-                                _ => None
-                            };
-                            match rdata {
-                                Some(_) if addr.is_unspecified() => {
-                                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
-                                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
-                                    continue 'accept
-                                }
-                                Some(rdata) => {
-                                    let rtype = match addr {
-                                        IpAddr::V4(_) => Type::A,
-                                        IpAddr::V6(_) => Type::AAAA,
-                                    };
-                                    let rheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
-                                    let mut rbuffer = [0; 512];
-                                    rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
-                                    rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
-                                    rbuffer[qend..][0..2].clone_from_slice(&[0xC0, 12]);
-                                    rbuffer[qend..][2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
-                                    rbuffer[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
-                                    rbuffer[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
-                                    rbuffer[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
-                                    rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
-                                    let rpacket = &rbuffer[..qend+12+rdata.len()];
-                                    server.send_to(&rpacket, remote).unwrap_or_default();
-                                    continue 'accept
-                                }
-                                None => {}
+                                Some(addr.octets().to_vec())
                             }
+                            (Type::AAAA | Type::ALL, IpAddr::V6(addr)) => {
+                                if verbose {
+                                    eprintln!("Found in {}", hosts_files.join(" or "));
+                                    eprintln!("  {} {}", addr, host);
+                                }
+                                Some(addr.octets().to_vec())
+                            }
+                            _ => None
+                        };
+                        match rdata {
+                            Some(_) if addr.is_unspecified() => {
+                                let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
+                                server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
+                                continue 'accept
+                            }
+                            Some(rdata) => {
+                                let rtype = match addr {
+                                    IpAddr::V4(_) => Type::A,
+                                    IpAddr::V6(_) => Type::AAAA,
+                                };
+                                let rheader = Header::answer(qheader.id, qheader.opcode, 1, 1);
+                                let mut rbuffer = [0; 512];
+                                rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
+                                rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
+                                rbuffer[qend..][0..2].clone_from_slice(&[0xC0, 12]);
+                                rbuffer[qend..][2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
+                                rbuffer[qend..][4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
+                                rbuffer[qend..][6..10].clone_from_slice(&local_ttl.to_be_bytes());
+                                rbuffer[qend..][10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
+                                rbuffer[qend..][12..12+rdata.len()].clone_from_slice(&rdata);
+                                let rpacket = &rbuffer[..qend+12+rdata.len()];
+                                server.send_to(&rpacket, remote).unwrap_or_default();
+                                continue 'accept
+                            }
+                            None => {}
                         }
                     }
                 }
