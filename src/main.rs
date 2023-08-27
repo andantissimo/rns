@@ -348,7 +348,7 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
 
 fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String, Vec<IpAddr>)> {
     let patterns = if let Some(dot) = host.find('.') {
-        vec![host.to_string(), format!("*{}", host[dot..].to_string())]
+        vec![host.to_string(), format!("*{}", &host[dot..])]
     } else {
         vec![host.to_string()]
     };
