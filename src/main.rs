@@ -6,10 +6,21 @@ use std::fs::{metadata, read_to_string};
 use std::io::{ErrorKind, Result as IOResult};
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket, Ipv6Addr};
-use std::str::{FromStr, from_utf8};
+use std::str::from_utf8;
 use std::sync::{Arc, RwLock};
 use std::thread::{sleep, spawn};
 use std::time::{Duration, SystemTime};
+
+#[inline]
+fn unmap_ipv4_in_ipv6(addr: &IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => match v6.segments() {
+            [0, 0, 0, 0, 0, 0xFFFF, hi, lo] => IpAddr::V4(((hi as u32) << 16 | lo as u32).into()),
+            _ => *addr,
+        }
+        _ => *addr,
+    }
+}
 
 #[allow(dead_code)]
 #[repr(u8)]
@@ -438,7 +449,7 @@ fn main() -> IOResult<()> {
     });
     let nameservers: Vec<SocketAddr> = read_to_string("/etc/resolv.conf")?.split('\n')
         .filter(|line| line.starts_with("nameserver "))
-        .map(|line| IpAddr::from_str(line[11..].trim()).expect("unexpected syntax in resolv.conf"))
+        .map(|line| line[11..].trim().parse::<IpAddr>().expect("unexpected syntax in resolv.conf"))
         .map(|addr| SocketAddr::new(addr, 53))
         .collect();
     let timeout = Duration::from_secs(15);
@@ -461,9 +472,10 @@ fn main() -> IOResult<()> {
         let mut qbuffer = [0; 512];
         match server.recv_from(&mut qbuffer) {
             Ok((qlength, remote)) => {
+                let remote_addr = unmap_ipv4_in_ipv6(&remote.ip());
                 let qpacket = &qbuffer[..qlength];
                 let qheader = Header::from_bytes(&qpacket);
-                if verbose { eprintln!("{} from {}", qheader, remote) }
+                if verbose { eprintln!("{} from {}", qheader, remote_addr) }
                 if qheader.qr || qheader.aa || qheader.ra || qheader.rcode != Rcode::NOERROR || qheader.ancount > 0 {
                     let rheader = Header::error(qheader.id, qheader.opcode, Rcode::FORMERR);
                     server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
@@ -488,11 +500,11 @@ fn main() -> IOResult<()> {
                     }
                     let mut addrs: Vec<IpAddr> = matches.into_iter()
                         .flat_map(|(_, addrs)| addrs)
-                        .filter(|addr| match (addr, question.qtype, remote) {
-                            (IpAddr::V4(_), Type::A | Type::ALL, _) => true,
-                            (IpAddr::V6(_), Type::AAAA | Type::ALL, _) => true,
-                            (IpAddr::V6(_), Type::A, SocketAddr::V6(_)) => true,
-                            _ => false,
+                        .filter(|addr| match question.qtype {
+                            Type::A    => addr.is_ipv4() || remote_addr.is_ipv6(),
+                            Type::AAAA => addr.is_ipv6(),
+                            Type::ALL  => true,
+                            _          => false,
                         })
                         .collect();
                     addrs.sort_by(|a, b| {
