@@ -422,10 +422,10 @@ fn main() -> IOResult<()> {
         hosts
     }));
     let hosts_writer = hosts_reader.clone();
-    let hosts_files_clone = hosts_files.clone();
+    let hosts_files_reader = hosts_files.clone();
     let hosts_files_watch_interval = Duration::from_secs(4);
     spawn(move || {
-        let hosts_files = hosts_files_clone;
+        let hosts_files = hosts_files_reader;
         let min_mtime = SystemTime::UNIX_EPOCH;
         let get_mtime = |path: &str|
             if let Ok(m) = metadata(path) { m.modified().unwrap() } else { min_mtime };
@@ -447,122 +447,135 @@ fn main() -> IOResult<()> {
             if verbose { eprintln!("Reloaded {}", hosts_files.join(" and ")) }
         }
     });
-    let nameservers: Vec<SocketAddr> = read_to_string("/etc/resolv.conf")?.split('\n')
+    let nameservers: Arc<Vec<SocketAddr>> = Arc::new(read_to_string("/etc/resolv.conf")?.split('\n')
         .filter(|line| line.starts_with("nameserver "))
         .map(|line| line[11..].trim().parse::<IpAddr>().expect("unexpected syntax in resolv.conf"))
         .map(|addr| SocketAddr::new(addr, 53))
-        .collect();
+        .collect());
     let timeout = Duration::from_secs(15);
     let server = UdpSocket::bind(if ipv4only {
         SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53)
     } else {
         SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 53)
     })?;
-    let client = UdpSocket::bind(if nameservers.iter().any(|a| a.is_ipv4()) {
-        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
-    } else {
-        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
-    })?;
-    client.connect(&nameservers[..])?;
     server.set_read_timeout(Some(timeout))?;
     server.set_write_timeout(Some(timeout))?;
-    client.set_read_timeout(Some(timeout))?;
-    client.set_write_timeout(Some(timeout))?;
-    'accept: loop {
+    loop {
         let mut qbuffer = [0; 512];
         match server.recv_from(&mut qbuffer) {
             Ok((qlength, remote)) => {
+                let qpacket = qbuffer[..qlength].to_vec();
                 let remote_addr = unmap_ipv4_in_ipv6(&remote.ip());
-                let qpacket = &qbuffer[..qlength];
-                let qheader = Header::from_bytes(&qpacket);
-                if verbose { eprintln!("{} from {}", qheader, remote_addr) }
-                if qheader.qr || qheader.aa || qheader.ra || qheader.rcode != Rcode::NOERROR || qheader.ancount > 0 {
-                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::FORMERR);
-                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
-                    continue 'accept
-                }
-                if qheader.opcode != Opcode::QUERY || qheader.tc || qheader.qdcount != 1 || qheader.nscount > 0 || qheader.arcount > 0 {
-                    let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NOTIMP);
-                    server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
-                    continue 'accept
-                }
-                let (question, qend) = Question::from_bytes(&qpacket, 12);
-                if verbose { eprintln!("  {}", question) }
-                let matches = match_hosts(&hosts_reader.read().unwrap(), &question.qname.to_string());
-                if matches.len() > 0 {
-                    if verbose {
-                        eprintln!("Found in {}", hosts_files.join(" or "));
-                        for (host, addrs) in matches.iter() {
-                            for addr in addrs.iter() {
-                                eprintln!("  {} {}", addr.to_string(), host)
+                let hosts_files = hosts_files.clone();
+                let hosts_reader = hosts_reader.clone();
+                let nameservers = nameservers.clone();
+                let server = server.try_clone()?;
+                spawn(move || {
+                    let qheader = Header::from_bytes(&qpacket);
+                    if verbose { eprintln!("{} from {}", qheader, remote_addr) }
+                    if qheader.qr || qheader.aa || qheader.ra || qheader.rcode != Rcode::NOERROR || qheader.ancount > 0 {
+                        let rheader = Header::error(qheader.id, qheader.opcode, Rcode::FORMERR);
+                        return server.send_to(&rheader.to_bytes(), remote).unwrap_or_default()
+                    }
+                    if qheader.opcode != Opcode::QUERY || qheader.tc || qheader.qdcount != 1 || qheader.nscount > 0 || qheader.arcount > 0 {
+                        let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NOTIMP);
+                        return server.send_to(&rheader.to_bytes(), remote).unwrap_or_default()
+                    }
+                    let (question, qend) = Question::from_bytes(&qpacket, 12);
+                    if verbose { eprintln!("  {}", question) }
+                    let matches = match_hosts(&hosts_reader.read().unwrap(), &question.qname.to_string());
+                    if matches.len() > 0 {
+                        if verbose {
+                            eprintln!("Found in {}", hosts_files.join(" or "));
+                            for (host, addrs) in matches.iter() {
+                                for addr in addrs.iter() {
+                                    eprintln!("  {} {}", addr, host)
+                                }
                             }
                         }
+                        let mut addrs: Vec<IpAddr> = matches.into_iter()
+                            .flat_map(|(_, addrs)| addrs)
+                            .filter(|addr| match question.qtype {
+                                Type::A    => addr.is_ipv4() || remote_addr.is_ipv6(),
+                                Type::AAAA => addr.is_ipv6(),
+                                Type::ALL  => true,
+                                _          => false,
+                            })
+                            .collect();
+                        addrs.sort_by(|a, b| {
+                            if a.is_ipv4() == b.is_ipv4() { return Ordering::Equal }
+                            if question.qtype != Type::AAAA && a.is_ipv4() { Ordering::Less } else { Ordering::Greater }
+                        });
+                        if addrs.is_empty() || addrs.iter().all(|addr| addr.is_unspecified()) {
+                            let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
+                            return server.send_to(&rheader.to_bytes(), remote).unwrap_or_default()
+                        }
+                        let ancount = addrs.iter().filter(|addr| !addr.is_unspecified()).count() as u16;
+                        let rheader = Header::answer(qheader.id, qheader.opcode, 1, ancount);
+                        let mut rbuffer = [0; 512];
+                        rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
+                        rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
+                        let mut rslice = &mut rbuffer[qend..];
+                        for addr in addrs.iter().filter(|addr| !addr.is_unspecified()) {
+                            let (rtype, rdata) = match addr {
+                                IpAddr::V4(addr) => (Type::A, addr.octets().to_vec()),
+                                IpAddr::V6(addr) => (Type::AAAA, addr.octets().to_vec()),
+                            };
+                            rslice[0..2].clone_from_slice(&[0xC0, 12]);
+                            rslice[2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
+                            rslice[4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
+                            rslice[6..10].clone_from_slice(&local_ttl.to_be_bytes());
+                            rslice[10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
+                            rslice[12..][..rdata.len()].clone_from_slice(&rdata);
+                            rslice = &mut rslice[12+rdata.len()..];
+                        }
+                        let rlength = rslice.as_ptr() as usize - rbuffer.as_ptr() as usize;
+                        let rpacket = &rbuffer[..rlength];
+                        return server.send_to(&rpacket, remote).unwrap_or_default()
                     }
-                    let mut addrs: Vec<IpAddr> = matches.into_iter()
-                        .flat_map(|(_, addrs)| addrs)
-                        .filter(|addr| match question.qtype {
-                            Type::A    => addr.is_ipv4() || remote_addr.is_ipv6(),
-                            Type::AAAA => addr.is_ipv6(),
-                            Type::ALL  => true,
-                            _          => false,
-                        })
-                        .collect();
-                    addrs.sort_by(|a, b| {
-                        if a.is_ipv4() == b.is_ipv4() { return Ordering::Equal }
-                        if question.qtype != Type::AAAA && a.is_ipv4() { Ordering::Less } else { Ordering::Greater }
-                    });
-                    if addrs.is_empty() || addrs.iter().all(|addr| addr.is_unspecified()) {
-                        let rheader = Header::error(qheader.id, qheader.opcode, Rcode::NXDOMAIN);
-                        server.send_to(&rheader.to_bytes(), remote).unwrap_or_default();
-                        continue 'accept
-                    }
-                    let ancount = addrs.iter().filter(|addr| !addr.is_unspecified()).count() as u16;
-                    let rheader = Header::answer(qheader.id, qheader.opcode, 1, ancount);
+                    let query_nameserver = |qpacket: &[u8], rbuffer: &mut [u8]| -> IOResult<(usize, IpAddr)> {
+                        let client = UdpSocket::bind(if nameservers.iter().all(|a| a.is_ipv4()) {
+                            SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+                        } else {
+                            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+                        })?;
+                        client.connect(&nameservers[..])?;
+                        client.set_read_timeout(Some(timeout))?;
+                        client.set_write_timeout(Some(timeout))?;
+                        client.send(&qpacket)?;
+                        let rlength = client.recv(rbuffer)?;
+                        Ok((rlength, client.peer_addr().unwrap().ip()))
+                    };
                     let mut rbuffer = [0; 512];
-                    rbuffer[0..12].clone_from_slice(&rheader.to_bytes());
-                    rbuffer[12..qend].clone_from_slice(&qpacket[12..qend]);
-                    let mut rslice = &mut rbuffer[qend..];
-                    for addr in addrs.iter().filter(|addr| !addr.is_unspecified()) {
-                        let (rtype, rdata) = match addr {
-                            IpAddr::V4(addr) => (Type::A, addr.octets().to_vec()),
-                            IpAddr::V6(addr) => (Type::AAAA, addr.octets().to_vec()),
-                        };
-                        rslice[0..2].clone_from_slice(&[0xC0, 12]);
-                        rslice[2..4].clone_from_slice(&(rtype as u16).to_be_bytes());
-                        rslice[4..6].clone_from_slice(&(question.qclass as u16).to_be_bytes());
-                        rslice[6..10].clone_from_slice(&local_ttl.to_be_bytes());
-                        rslice[10..12].clone_from_slice(&(rdata.len() as u16).to_be_bytes());
-                        rslice[12..][..rdata.len()].clone_from_slice(&rdata);
-                        rslice = &mut rslice[12+rdata.len()..];
-                    }
-                    let rlength = rslice.as_ptr() as usize - rbuffer.as_ptr() as usize;
-                    let rpacket = &rbuffer[..rlength];
-                    server.send_to(&rpacket, remote).unwrap_or_default();
-                    continue 'accept
-                }
-                client.send(&qpacket)?;
-                let mut rbuffer = [0; 512];
-                let rlength = client.recv(&mut rbuffer)?;
-                let rpacket = &rbuffer[..rlength];
-                if verbose {
-                    let rheader = Header::from_bytes(&rpacket);
-                    eprintln!("{} from {}", rheader, client.peer_addr().unwrap());
-                    let mut offset = 12;
-                    for _ in 0..rheader.qdcount {
-                        let (question, qend) = Question::from_bytes(&rpacket, offset);
-                        eprintln!("  {}", question);
-                        offset = qend;
-                    }
-                    for (count, kind) in [(rheader.ancount, "AN"), (rheader.nscount, "NS"), (rheader.arcount, "AR")] {
-                        for i in 0..count {
-                            let (record, rend) = Record::from_bytes(&rpacket, offset);
-                            if i == 0 { eprintln!("{}", kind) }
-                            eprintln!("  {}", record);
-                            offset = rend;
+                    match query_nameserver(&qpacket, &mut rbuffer) {
+                        Ok((rlength, peer_addr)) => {
+                            let rpacket = &rbuffer[..rlength];
+                            if verbose {
+                                let rheader = Header::from_bytes(&rpacket);
+                                eprintln!("{} from {}", rheader, peer_addr);
+                                let mut offset = 12;
+                                for _ in 0..rheader.qdcount {
+                                    let (question, qend) = Question::from_bytes(&rpacket, offset);
+                                    eprintln!("  {}", question);
+                                    offset = qend;
+                                }
+                                for (count, kind) in [(rheader.ancount, "AN"), (rheader.nscount, "NS"), (rheader.arcount, "AR")] {
+                                    for i in 0..count {
+                                        let (record, rend) = Record::from_bytes(&rpacket, offset);
+                                        if i == 0 { eprintln!("{}", kind) }
+                                        eprintln!("  {}", record);
+                                        offset = rend;
+                                    }
+                                }
+                            }
+                            return server.send_to(&rpacket, remote).unwrap_or_default();
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {:?}", e);
                         }
                     }
-                }
-                server.send_to(&rpacket, remote).unwrap_or_default();
+                    0
+                });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 // not an error, ignore
