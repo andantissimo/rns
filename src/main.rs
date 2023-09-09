@@ -346,18 +346,19 @@ impl Display for Record<'_> {
 fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
     for line in content.split('\n').filter(|s| s.len() > 0 && !s.starts_with('#')) {
         let mut iter = line.split_ascii_whitespace().filter(|s| s.len() > 0);
-        if let Some(addr) = iter.next().and_then(|s| s.parse::<IpAddr>().ok()) {
-            for host in iter {
-                hosts.entry(host.to_string()).or_default().push(addr)
+        if let Some(addr) = iter.next().and_then(|s| s.parse().ok()) {
+            for s in iter {
+                hosts.entry(s.to_ascii_lowercase()).or_default().push(addr)
             }
         }
     }
 }
 
-fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String, Vec<IpAddr>)> {
-    let patterns = match host.find('.') {
-        Some(dot) => vec![host.to_string(), format!("*{}", &host[dot..])],
-        None => vec![host.to_string()]
+fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, hostname: &str) -> Vec<(String, Vec<IpAddr>)> {
+    let hostname = hostname.to_ascii_lowercase();
+    let patterns = match hostname.find('.') {
+        Some(dot) => vec![hostname.clone(), format!("*{}", &hostname[dot..])],
+        None => vec![hostname.clone()]
     };
     let mut matches = Vec::new();
     for pat in patterns {
@@ -366,7 +367,7 @@ fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String,
         }
     }
     if let Some((pat, addrs)) = hosts.iter().find(|(pat, _)| {
-        pat.starts_with("**.") && (host == &pat[3..] || host.ends_with(&pat[2..]))
+        pat.starts_with("**.") && (hostname == &pat[3..] || hostname.ends_with(&pat[2..]))
     }) {
         matches.push((pat.clone(), addrs.clone()))
     }
@@ -374,7 +375,7 @@ fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String,
 }
 
 fn main() -> IoResult<()> {
-    let show_help_and_exit = |code| {
+    let print_help_and_exit = |code| {
         eprintln!("Usage: rns [options...]");
         eprintln!();
         eprintln!("Options:");
@@ -393,18 +394,18 @@ fn main() -> IoResult<()> {
         let mut iter = args().skip(1);
         while let Some(k) = iter.next() {
             match k.as_str() {
-                "-h" | "--help" => show_help_and_exit(0),
+                "-h" | "--help" => print_help_and_exit(0),
                 "-v" | "--verbose" => verbose = true,
                 "-4" | "--ipv4-only" => ipv4only = true,
                 "-H" | "--addn-hosts" => match iter.next() {
                     Some(v) => files.push(v),
-                    None => show_help_and_exit(1)
+                    None => print_help_and_exit(1)
                 }
-                "-T" | "--local-ttl" => match iter.next().and_then(|v| v.parse::<u32>().ok()) {
+                "-T" | "--local-ttl" => match iter.next().and_then(|v| v.parse().ok()) {
                     Some(v) => ttl = v,
-                    None => show_help_and_exit(1)
+                    None => print_help_and_exit(1)
                 }
-                _ => show_help_and_exit(1)
+                _ => print_help_and_exit(1)
             }
         }
         (verbose, ipv4only, Arc::new(files), ttl)
