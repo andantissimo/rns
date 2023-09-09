@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::env::args;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs::{metadata, read_to_string};
-use std::io::{ErrorKind, Result as IOResult};
+use std::io::{ErrorKind, Result as IoResult};
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket, Ipv6Addr};
-use std::str::from_utf8;
+use std::process::exit;
 use std::sync::{Arc, RwLock};
 use std::thread::{sleep, spawn};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, UNIX_EPOCH};
 
 #[inline]
 fn unmap_ipv4_in_ipv6(addr: &IpAddr) -> IpAddr {
@@ -293,8 +293,7 @@ impl Display for Name<'_> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         Ok(for (i, label) in self.labels.iter().enumerate() {
             if i > 0 { write!(f, ".")? }
-            String::from_iter(label.iter().map(|c| *c as char));
-            write!(f, "{}", from_utf8(label).unwrap_or("?"))?
+            write!(f, "{}", String::from_utf8_lossy(label))?
         })
     }
 }
@@ -336,7 +335,7 @@ impl Display for Record<'_> {
             }
             Type::TXT   => {
                 let length = self.rdata[0] as usize;
-                write!(f, " \"{}\"", from_utf8(&self.rdata[1..][..length]).unwrap())
+                write!(f, " \"{}\"", String::from_utf8_lossy(&self.rdata[1..][..length]))
             }
             Type::AAAA  => write!(f, " {}", IpAddr::from(TryInto::<[u8; 16]>::try_into(self.rdata).unwrap())),
             _            => Ok(for x in self.rdata { write!(f, " {:02X}", x)? }),
@@ -346,39 +345,36 @@ impl Display for Record<'_> {
 
 fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
     for line in content.split('\n').filter(|s| s.len() > 0 && !s.starts_with('#')) {
-        let mut addr: Option<IpAddr> = None;
-        for (i, s) in line.split(char::is_whitespace).filter(|s| s.len() > 0).enumerate() {
-            if i == 0 {
-                addr = Some(s.parse().unwrap_or(Ipv4Addr::UNSPECIFIED.into()));
-            } else {
-                hosts.entry(s.to_string()).or_default().push(addr.unwrap());
+        let mut iter = line.split_ascii_whitespace().filter(|s| s.len() > 0);
+        if let Some(addr) = iter.next().and_then(|s| s.parse::<IpAddr>().ok()) {
+            for host in iter {
+                hosts.entry(host.to_string()).or_default().push(addr)
             }
         }
     }
 }
 
 fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, host: &str) -> Vec<(String, Vec<IpAddr>)> {
-    let patterns = if let Some(dot) = host.find('.') {
-        vec![host.to_string(), format!("*{}", &host[dot..])]
-    } else {
-        vec![host.to_string()]
+    let patterns = match host.find('.') {
+        Some(dot) => vec![host.to_string(), format!("*{}", &host[dot..])],
+        None => vec![host.to_string()]
     };
     let mut matches = Vec::new();
-    for pattern in patterns {
-        if let Some((_, addrs)) = hosts.get_key_value(&pattern) {
-            matches.push((pattern, addrs.clone()))
+    for pat in patterns {
+        if let Some((_, addrs)) = hosts.get_key_value(&pat) {
+            matches.push((pat, addrs.clone()))
         }
     }
-    if let Some((pattern, addrs)) = hosts.iter().find(|(pat, _)| {
+    if let Some((pat, addrs)) = hosts.iter().find(|(pat, _)| {
         pat.starts_with("**.") && (host == &pat[3..] || host.ends_with(&pat[2..]))
     }) {
-        matches.push((pattern.clone(), addrs.clone()))
+        matches.push((pat.clone(), addrs.clone()))
     }
     matches
 }
 
-fn main() -> IOResult<()> {
-    if args().any(|a| a == "-h" || a == "--help") {
+fn main() -> IoResult<()> {
+    let show_help_and_exit = |code| {
         eprintln!("Usage: rns [options...]");
         eprintln!();
         eprintln!("Options:");
@@ -387,57 +383,54 @@ fn main() -> IOResult<()> {
         eprintln!("  -4, --ipv4-only          Listen on 0.0.0.0:53 instead of [::]:53");
         eprintln!("  -H, --addn-hosts <path>  Hosts files to be read in addition to /etc/hosts");
         eprintln!("  -T, --local-ttl  <int>   Time-to-live in seconds for replies from /etc/hosts");
-        return Ok(());
-    }
+        exit(code)
+    };
     let (verbose, ipv4only, hosts_files, local_ttl) = {
         let mut verbose = false;
         let mut ipv4only = false;
         let mut files = vec!["/etc/hosts".to_string()];
         let mut ttl: u32 = 0;
-        let mut it = args();
-        while let Some(k) = it.next() {
+        let mut iter = args().skip(1);
+        while let Some(k) = iter.next() {
             match k.as_str() {
-                "-v" | "--verbose" => {
-                    verbose = true;
+                "-h" | "--help" => show_help_and_exit(0),
+                "-v" | "--verbose" => verbose = true,
+                "-4" | "--ipv4-only" => ipv4only = true,
+                "-H" | "--addn-hosts" => match iter.next() {
+                    Some(v) => files.push(v),
+                    None => show_help_and_exit(1)
                 }
-                "-4" | "--ipv4-only" => {
-                    ipv4only = true;
+                "-T" | "--local-ttl" => match iter.next().and_then(|v| v.parse::<u32>().ok()) {
+                    Some(v) => ttl = v,
+                    None => show_help_and_exit(1)
                 }
-                "-H" | "--addn-hosts" => {
-                    if let Some(v) = it.next() { files.push(v) }
-                }
-                "-T" | "--local-ttl" => {
-                    if let Some(v) = it.next() { ttl = v.parse().unwrap_or(ttl) }
-                }
-                _ => {}
+                _ => show_help_and_exit(1)
             }
         }
         (verbose, ipv4only, Arc::new(files), ttl)
     };
     let hosts_reader = Arc::new(RwLock::new({
         let mut hosts = HashMap::new();
-        for path in hosts_files.iter() {
-            parse_hosts(&read_to_string(path).unwrap_or_default(), &mut hosts);
+        for content in hosts_files.iter().filter_map(|path| read_to_string(&path).ok()) {
+            parse_hosts(&content, &mut hosts);
         }
         hosts
     }));
     let hosts_writer = hosts_reader.clone();
     let hosts_files_reader = hosts_files.clone();
-    let hosts_files_watch_interval = Duration::from_secs(4);
     spawn(move || {
         let hosts_files = hosts_files_reader;
-        let min_mtime = SystemTime::UNIX_EPOCH;
-        let get_mtime = |path: &str|
-            if let Ok(m) = metadata(path) { m.modified().unwrap() } else { min_mtime };
-        let mut lastmtime = hosts_files.iter().fold(min_mtime, |t, p| get_mtime(p).max(t));
+        let f = |mtime, path|
+            metadata(path).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH).max(mtime);
+        let mut lastmtime = hosts_files.iter().fold(UNIX_EPOCH, f);
         loop {
-            sleep(hosts_files_watch_interval);
-            let mtime = hosts_files.iter().fold(min_mtime, |t, p| get_mtime(p).max(t));
+            sleep(Duration::from_secs(4));
+            let mtime = hosts_files.iter().fold(UNIX_EPOCH, f);
             if mtime == lastmtime { continue }
             lastmtime = mtime;
             let mut hosts = HashMap::new();
-            for path in hosts_files.iter() {
-                parse_hosts(&read_to_string(path).unwrap_or_default(), &mut hosts);
+            for content in hosts_files.iter().filter_map(|path| read_to_string(path).ok()) {
+                parse_hosts(&content, &mut hosts);
             }
             let mut writer = hosts_writer.write().unwrap();
             writer.clear();
@@ -447,11 +440,11 @@ fn main() -> IOResult<()> {
             if verbose { eprintln!("Reloaded {}", hosts_files.join(" and ")) }
         }
     });
-    let nameservers: Arc<Vec<SocketAddr>> = Arc::new(read_to_string("/etc/resolv.conf")?.split('\n')
+    let nameservers = Arc::new(read_to_string("/etc/resolv.conf")?.split('\n')
         .filter(|line| line.starts_with("nameserver "))
-        .map(|line| line[11..].trim().parse::<IpAddr>().expect("unexpected syntax in resolv.conf"))
-        .map(|addr| SocketAddr::new(addr, 53))
-        .collect());
+        .filter_map(|line| line[11..].trim().parse::<IpAddr>().ok())
+        .map(|addr| (addr, 53).into())
+        .collect::<Vec<SocketAddr>>());
     let timeout = Duration::from_secs(15);
     let server = UdpSocket::bind(if ipv4only {
         SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53)
@@ -493,7 +486,7 @@ fn main() -> IOResult<()> {
                                 }
                             }
                         }
-                        let mut addrs: Vec<IpAddr> = matches.into_iter()
+                        let mut addrs = matches.into_iter()
                             .flat_map(|(_, addrs)| addrs)
                             .filter(|addr| match question.qtype {
                                 Type::A    => addr.is_ipv4() || remote_addr.is_ipv6(),
@@ -501,7 +494,7 @@ fn main() -> IOResult<()> {
                                 Type::ALL  => true,
                                 _          => false,
                             })
-                            .collect();
+                            .collect::<Vec<IpAddr>>();
                         addrs.sort_by(|a, b| {
                             if a.is_ipv4() == b.is_ipv4() { return Ordering::Equal }
                             if question.qtype != Type::AAAA && a.is_ipv4() { Ordering::Less } else { Ordering::Greater }
@@ -533,7 +526,7 @@ fn main() -> IOResult<()> {
                         let rpacket = &rbuffer[..rlength];
                         return server.send_to(&rpacket, remote).unwrap_or_default()
                     }
-                    let query_nameserver = |qpacket: &[u8], rbuffer: &mut [u8]| -> IOResult<(usize, IpAddr)> {
+                    let query_nameserver = |qpacket: &[u8], rbuffer: &mut [u8]| -> IoResult<(usize, IpAddr)> {
                         let client = UdpSocket::bind(if nameservers.iter().all(|a| a.is_ipv4()) {
                             SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
                         } else {
@@ -555,16 +548,20 @@ fn main() -> IOResult<()> {
                                 eprintln!("{} from {}", rheader, peer_addr);
                                 let mut offset = 12;
                                 for _ in 0..rheader.qdcount {
-                                    let (question, qend) = Question::from_bytes(&rpacket, offset);
+                                    let (question, end) = Question::from_bytes(&rpacket, offset);
                                     eprintln!("  {}", question);
-                                    offset = qend;
+                                    offset = end;
                                 }
-                                for (count, kind) in [(rheader.ancount, "AN"), (rheader.nscount, "NS"), (rheader.arcount, "AR")] {
+                                for (count, kind) in [
+                                    (rheader.ancount, "AN"),
+                                    (rheader.nscount, "NS"),
+                                    (rheader.arcount, "AR"),
+                                ] {
                                     for i in 0..count {
-                                        let (record, rend) = Record::from_bytes(&rpacket, offset);
+                                        let (record, end) = Record::from_bytes(&rpacket, offset);
                                         if i == 0 { eprintln!("{}", kind) }
                                         eprintln!("  {}", record);
-                                        offset = rend;
+                                        offset = end;
                                     }
                                 }
                             }
@@ -572,9 +569,9 @@ fn main() -> IOResult<()> {
                         }
                         Err(e) => {
                             eprintln!("Error: {:?}", e);
+                            return 0
                         }
                     }
-                    0
                 });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
