@@ -415,7 +415,7 @@ fn main() -> IoResult<()> {
         for content in hosts_files.iter().filter_map(|path| read_to_string(&path).ok()) {
             parse_hosts(&content, &mut hosts);
         }
-        hosts
+        Some(hosts)
     }));
     let hosts_writer = hosts_reader.clone();
     let hosts_files_reader = hosts_files.clone();
@@ -433,11 +433,7 @@ fn main() -> IoResult<()> {
             for content in hosts_files.iter().filter_map(|path| read_to_string(path).ok()) {
                 parse_hosts(&content, &mut hosts);
             }
-            let mut writer = hosts_writer.write().unwrap();
-            writer.clear();
-            for (k, v) in hosts {
-                writer.insert(k, v);
-            }
+            hosts_writer.write().unwrap().replace(hosts);
             if verbose { eprintln!("Reloaded {}", hosts_files.join(" and ")) }
         }
     });
@@ -477,7 +473,7 @@ fn main() -> IoResult<()> {
                     }
                     let (question, qend) = Question::from_bytes(&qpacket, 12);
                     if verbose { eprintln!("  {}", question) }
-                    let matches = match_hosts(&hosts_reader.read().unwrap(), &question.qname.to_string());
+                    let matches = match_hosts(&hosts_reader.read().unwrap().as_ref().unwrap(), &question.qname.to_string());
                     if matches.len() > 0 {
                         if verbose {
                             eprintln!("Found in {}", hosts_files.join(" or "));
