@@ -355,23 +355,13 @@ fn parse_hosts(content: &str, hosts: &mut HashMap<String, Vec<IpAddr>>) {
 }
 
 fn match_hosts(hosts: &HashMap<String, Vec<IpAddr>>, hostname: &str) -> Vec<(String, Vec<IpAddr>)> {
-    let hostname = hostname.to_ascii_lowercase();
-    let patterns = match hostname.find('.') {
-        Some(dot) => vec![hostname.clone(), format!("*{}", &hostname[dot..])],
-        None => vec![hostname.clone()]
-    };
-    let mut matches = Vec::new();
-    for pat in patterns {
-        if let Some((_, addrs)) = hosts.get_key_value(&pat) {
-            matches.push((pat, addrs.clone()))
-        }
-    }
-    if let Some((pat, addrs)) = hosts.iter().find(|(pat, _)| {
-        pat.starts_with("**.") && (hostname == &pat[3..] || hostname.ends_with(&pat[2..]))
-    }) {
-        matches.push((pat.clone(), addrs.clone()))
-    }
-    matches
+    hosts.iter().filter(|(pat, _)| match pat.as_str() {
+        pat if !pat.starts_with("*.") => pat.eq_ignore_ascii_case(hostname),
+        pat => pat[2..].eq_ignore_ascii_case(hostname)
+                  || pat.len() <= hostname.len() && pat[1..].eq_ignore_ascii_case(&hostname[(hostname.len() + 1 - pat.len())..])
+    })
+    .map(|(pat, addrs)| (pat.clone(), addrs.clone()))
+    .collect()
 }
 
 fn main() -> IoResult<()> {
