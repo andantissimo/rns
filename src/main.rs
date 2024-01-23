@@ -371,14 +371,14 @@ fn main() -> IoResult<()> {
         eprintln!("Options:");
         eprintln!("  -h, --help               Show this help message and exit");
         eprintln!("  -v, --verbose            Increase verbosity");
-        eprintln!("  -4, --ipv4-only          Listen on 0.0.0.0:53 instead of [::]:53");
+        eprintln!("  -a, --address <ipaddr>   Listen on the given IP address instead of [::]");
         eprintln!("  -H, --addn-hosts <path>  Hosts files to be read in addition to /etc/hosts");
         eprintln!("  -T, --local-ttl  <int>   Time-to-live in seconds for replies from /etc/hosts");
         exit(code)
     };
-    let (verbose, ipv4only, hosts_files, local_ttl) = {
+    let (verbose, address, hosts_files, local_ttl) = {
         let mut verbose = false;
-        let mut ipv4only = false;
+        let mut address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
         let mut files = vec!["/etc/hosts".to_string()];
         let mut ttl: u32 = 0;
         let mut iter = args().skip(1);
@@ -386,7 +386,10 @@ fn main() -> IoResult<()> {
             match k.as_str() {
                 "-h" | "--help" => print_help_and_exit(0),
                 "-v" | "--verbose" => verbose = true,
-                "-4" | "--ipv4-only" => ipv4only = true,
+                "-a" | "--address" => match iter.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => address = v,
+                    None => print_help_and_exit(1)
+                }
                 "-H" | "--addn-hosts" => match iter.next() {
                     Some(v) => files.push(v),
                     None => print_help_and_exit(1)
@@ -398,7 +401,7 @@ fn main() -> IoResult<()> {
                 _ => print_help_and_exit(1)
             }
         }
-        (verbose, ipv4only, Arc::new(files), ttl)
+        (verbose, address, Arc::new(files), ttl)
     };
     let hosts_reader = Arc::new(RwLock::new({
         let mut hosts = HashMap::new();
@@ -435,11 +438,7 @@ fn main() -> IoResult<()> {
         .map(|addr| (addr, 53).into())
         .collect::<Vec<SocketAddr>>());
     let timeout = Duration::from_secs(15);
-    let server = UdpSocket::bind(if ipv4only {
-        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53)
-    } else {
-        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 53)
-    })?;
+    let server = UdpSocket::bind((address, 53))?;
     server.set_read_timeout(Some(timeout))?;
     server.set_write_timeout(Some(timeout))?;
     loop {
